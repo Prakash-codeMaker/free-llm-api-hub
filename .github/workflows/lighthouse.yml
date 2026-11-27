@@ -21,8 +21,10 @@ name: Lighthouse
 #     and pages measured side by side get the same verdict as one at a time.
 #     The job keeps the name of the required check.
 #   - Push to main, nightly and manual runs: performance, median of three runs
-#     per page (one run moves too much: 0.78 and 0.91 on the same commit). A
-#     failure on main opens or updates one issue; a later clean run closes it.
+#     per page (one run moves too much: 0.78 and 0.91 on the same commit). One
+#     issue tracks each failure episode: each failing run refreshes its body, and
+#     a comment is added only when the failing pages or scores change. The first
+#     clean run records recovery in the body and closes the issue.
 #     Pushes by the regeneration bot (free-llm-api-hub-regen[bot]) are skipped.
 #
 # A change that cannot reach the built site (docs other than the methodology, workflows other than this one, root
@@ -161,31 +163,83 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT: ${{ github.sha }}
         run: |
+          set -euo pipefail
+
           title='Lighthouse performance below budget'
           number=$(gh issue list --state open --search "in:title \"$title\"" --json number,title \
             --jq "map(select(.title == \"$title\")) | .[0].number // empty")
           body=$(mktemp)
+          trap 'rm -f "$body"' EXIT
+          updated_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          fence=$(printf '\140\140\140')
+
           if [ "$RESULT" = failure ]; then
+            if [ -n "$FAILURES" ]; then
+              signature=$(printf '%s\n' "$FAILURES" | sha256sum | cut -d' ' -f1)
+            else
+              signature=$(printf '%s' 'NO_BUDGET_FAILURE_RECORDED' | sha256sum | cut -d' ' -f1)
+            fi
+
+            previous_signature=
+            if [ -n "$number" ]; then
+              previous_body=$(gh issue view "$number" --json body --jq .body)
+              previous_signature=$(printf '%s\n' "$previous_body" | \
+                sed -n 's/.*<!-- lighthouse-failure-signature:\([0-9a-f]*\) -->.*/\1/p' | head -n 1)
+
+              # Older issues have no stored signature; recover it from the prior
+              # workflow's fenced failure list when possible.
+              if [ -z "$previous_signature" ]; then
+                if printf '%s\n' "$previous_body" | grep -Fq "${fence}text"; then
+                  previous_failures=$(printf '%s\n' "$previous_body" | awk -v fence="$fence" '
+                    $0 == fence "text" && !inside { inside=1; next }
+                    inside && $0 == fence { exit }
+                    inside { print }
+                  ')
+                  previous_signature=$(printf '%s\n' "$previous_failures" | sha256sum | cut -d' ' -f1)
+                elif printf '%s\n' "$previous_body" | grep -q 'No budget failure was recorded'; then
+                  previous_signature=$(printf '%s' 'NO_BUDGET_FAILURE_RECORDED' | sha256sum | cut -d' ' -f1)
+                fi
+              fi
+            fi
+
             {
-              echo "The nightly/main Lighthouse performance check (median of three runs per page, threshold 0.80) failed on \`$COMMIT\`."
+              echo "<!-- lighthouse-failure-signature:$signature -->"
+              echo "The nightly/main Lighthouse performance check (median of three runs per page, threshold 0.80) failed."
+              echo
+              echo "Updated: $updated_at (UTC)"
+              echo "Commit: $COMMIT"
+              echo "Run: $RUN_URL"
               echo
               if [ -n "$FAILURES" ]; then
-                echo '```text'
-                printf '%s\n' "$FAILURES" | sed 's/```/` ` `/g'
-                echo '```'
+                echo 'Failing pages and scores:'
+                echo
+                printf '%stext\n' "$fence"
+                printf '%s\n' "$FAILURES"
+                printf '%s\n' "$fence"
               else
                 echo 'No budget failure was recorded: the job stopped before measuring (build or install error).'
               fi
-              echo
-              echo "Run: $RUN_URL"
             } > "$body"
+
             if [ -n "$number" ]; then
-              gh issue comment "$number" --body-file "$body"
+              gh issue edit "$number" --body-file "$body"
+              if [ -n "$previous_signature" ] && [ "$previous_signature" != "$signature" ]; then
+                gh issue comment "$number" --body "The Lighthouse failing-page set or scores changed on $COMMIT. The issue body now contains the latest report. Run: $RUN_URL"
+              fi
             else
-              gh issue create --title "$title" --label chore --body-file "$body"
+              gh issue create --title "$title" --label bug --label area:site --body-file "$body"
             fi
           elif [ -n "$number" ]; then
-            printf 'Performance is back within budget on `%s`.\n\nRun: %s\n' "$COMMIT" "$RUN_URL" > "$body"
-            gh issue comment "$number" --body-file "$body"
+            {
+              echo '## Performance recovered'
+              echo
+              echo 'The first clean main/nightly Lighthouse run is within budget.'
+              echo
+              echo "Updated: $updated_at (UTC)"
+              echo "Commit: $COMMIT"
+              echo "Run: $RUN_URL"
+            } > "$body"
+            gh issue edit "$number" --body-file "$body"
             gh issue close "$number" --reason completed
+          fi
           fi
