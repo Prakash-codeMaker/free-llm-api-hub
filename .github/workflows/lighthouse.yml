@@ -242,4 +242,3 @@ jobs:
             gh issue edit "$number" --body-file "$body"
             gh issue close "$number" --reason completed
           fi
-          fi
